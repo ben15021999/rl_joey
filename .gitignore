@@ -4,4 +4,4 @@ dist/*
 *.egg-info/*
 docs/build/*
 *__pycache__*
-model
+models
