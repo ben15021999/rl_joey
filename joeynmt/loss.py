@@ -6,6 +6,8 @@ Module to implement training loss
 import torch
 from torch import nn, Tensor
 from torch.autograd import Variable
+from joeynmt.metrics import bleu
+import numpy as np
 
 
 class XentLoss(nn.Module):
@@ -76,3 +78,47 @@ class XentLoss(nn.Module):
         loss = self.criterion(
             log_probs.contiguous().view(-1, log_probs.size(-1)), targets)
         return loss
+
+class ReinforceLoss(nn.Module):
+    """
+    Reinforce Loss
+    """
+    def __init__(self, baseline, use_cuda, reward: str="bleu"):
+        super(ReinforceLoss, self).__init__()
+        self.baseline = baseline
+        self.reward = reward
+        self.bleu = []
+        
+    def forward(self, predicted, gold, log_probs):
+        """
+        Compute the reinforce loss using logprobs and bleu scores
+        :param predicted: predicted sentences
+        :param gold: gold sentences
+        :return: loss, rewards for logging, unscaled rewards for logging
+        """
+        bleu_scores = [bleu([prediction], [gold_ref]) \
+                for prediction, gold_ref in zip(predicted, gold)]
+        # save unscaled rewards for logging
+        unscaled_rewards = bleu_scores
+        if self.reward == "constant":
+            bleu_scores = [1 for log_prob in log_probs]
+        elif self.reward == "scaled_bleu":
+            def scale(reward, a, b, minim, maxim):
+                if maxim-minim == 0:
+                    return 0
+                return (((b-a)*(reward - minim))/(maxim-minim)) + a
+            # local scale
+            maxim = max(bleu_scores)
+            minim = min(bleu_scores)
+            bleu_scores = [scale(score, -0.5, 0.5, minim, maxim) \
+                for score in bleu_scores]
+        elif self.reward == "bleu":
+            if self.baseline == "average_reward_baseline":
+                # global average
+                self.bleu.extend(bleu_scores)
+                average_bleu = np.mean(self.bleu)
+                bleu_scores = [score - average_bleu for score in bleu_scores]
+        # calculate PG loss with rewards and log probs
+        loss = sum([-log_prob*bleu_score \
+                for log_prob, bleu_score in zip(log_probs, bleu_scores)])
+        return loss, bleu_scores, unscaled_rewards

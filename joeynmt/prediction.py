@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 # pylint: disable=too-many-arguments,too-many-locals,no-member,too-many-branches
 def validate_on_data(model: Model, data: Dataset,
                      batch_size: int,
+                     config: dict,
                      use_cuda: bool, max_output_length: int,
                      level: str, eval_metric: Optional[str],
                      n_gpu: int,
@@ -93,9 +94,23 @@ def validate_on_data(model: Model, data: Dataset,
     valid_sources_raw = data.src
     pad_index = model.src_vocab.stoi[PAD_TOKEN]
     # disable dropout
+
+    # reinforcement learnin parameters
+    method = config["training"]["reinforcement_learning"]["method"]
+    samples = config["training"]["reinforcement_learning"]["hyperparameters"]["samples"]
+    alpha = config["training"]["reinforcement_learning"]["hyperparameters"]["alpha"]
+    reinforcement_learning = config["training"]["reinforcement_learning"]["use_reinforcement_learning"]
+    temperature = config["training"]["reinforcement_learning"]["hyperparameters"]["temperature"]
+    add_gold = config["training"]["reinforcement_learning"]["hyperparameters"].get("add_gold", False)
+    log_probabilities = config["training"]["reinforcement_learning"].get("log_probabilities", False)
+    pickle_logs = config["training"]["reinforcement_learning"].get("pickle_logs", False)
+    topk = config["training"]["reinforcement_learning"].get("topk", 20)
+
     model.eval()
     # don't track gradients during validation
     with torch.no_grad():
+        valid_data = [[] for i in range(11)]
+        entropy_divider = 0
         all_outputs = []
         valid_attention_scores = []
         total_loss = 0
@@ -114,12 +129,31 @@ def validate_on_data(model: Model, data: Dataset,
 
             # run as during training with teacher forcing
             if compute_loss and batch.trg is not None:
-                batch_loss, _, _, _ = model(return_type="loss", **vars(batch))
+                if reinforcement_learning:  
+                    batch_loss, distribution, _, _ = model(
+                        return_type=method, max_output_length=max_output_length,
+                        src=batch.src, trg=batch.trg,
+                        trg_input=batch.trg_input, src_mask=batch.src_mask,
+                        src_length=batch.src_length, trg_mask=batch.trg_mask,
+                        temperature=temperature,
+                        topk=topk,
+                        samples=samples, 
+                        alpha=alpha, 
+                        add_gold=add_gold,
+                        log_probabilities=log_probabilities, 
+                        pickle_logs=pickle_logs)
+                else:
+                    batch_loss, distribution, _, _ = model(return_type="loss", **vars(batch))
                 if n_gpu > 1:
                     batch_loss = batch_loss.mean() # average on multi-gpu
                 total_loss += batch_loss
                 total_ntokens += batch.ntokens
                 total_nseqs += batch.nseqs
+
+                if reinforcement_learning and log_probabilities:
+                    distribution[0] = [distribution[0]]
+                    for index, item in enumerate(distribution):
+                        valid_data[index].extend(item)
 
             # run as during inference to produce translations
             output, attention_scores = run_batch(
@@ -185,9 +219,12 @@ def validate_on_data(model: Model, data: Dataset,
         else:
             current_valid_score = -1
 
+    if valid_data[0]!=[]:
+        valid_data[0] = torch.mean(torch.stack(valid_data[0]))
+
     return current_valid_score, valid_loss, valid_ppl, valid_sources, \
         valid_sources_raw, valid_references, valid_hypotheses, \
-        decoded_valid, valid_attention_scores
+        decoded_valid, valid_attention_scores, valid_data
 
 
 def parse_test_args(cfg, mode="test"):

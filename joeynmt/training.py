@@ -11,6 +11,7 @@ from typing import List, Tuple
 import logging
 import os
 import sys
+import pickle
 from pathlib import Path
 import numpy as np
 
@@ -25,10 +26,11 @@ from joeynmt.model import build_model
 from joeynmt.batch import Batch
 from joeynmt.helpers import log_data_info, load_config, log_cfg, \
     store_attention_plots, load_checkpoint, make_model_dir, \
-    make_logger, set_seed, symlink_update, delete_ckpt, ConfigurationError
+    make_logger, set_seed, symlink_update, delete_ckpt, ConfigurationError, \
+    make_retro_logger
 from joeynmt.model import Model, _DataParallel
 from joeynmt.prediction import validate_on_data
-from joeynmt.loss import XentLoss
+from joeynmt.loss import XentLoss, ReinforceLoss
 from joeynmt.data import load_data, make_data_iter
 from joeynmt.builders import build_optimizer, build_scheduler, \
     build_gradient_clipper
@@ -62,10 +64,34 @@ class TrainManager:
         """
         train_config = config["training"]
         self.batch_class = batch_class
+        self.config = config
+
+        # reinforcement learning parameters
+        self.reinforcement_learning = train_config["reinforcement_learning"].get("use_reinforcement_learning", False)
+        self.temperature = train_config["reinforcement_learning"]["hyperparameters"].get("temperature", 1)
+        self.baseline = train_config["reinforcement_learning"]["hyperparameters"].get("baseline", False)
+        self.reward = train_config["reinforcement_learning"]["hyperparameters"].get("reward", 'bleu')
+        self.method = train_config["reinforcement_learning"].get("method", 'reinforce')
+        self.samples = train_config["reinforcement_learning"]["hyperparameters"].get("samples", 5)
+        self.alpha = train_config["reinforcement_learning"]["hyperparameters"].get("alpha", 0.005)
+        self.add_gold = train_config["reinforcement_learning"]["hyperparameters"].get("add_gold", False)
+        self.log_probabilities = train_config["reinforcement_learning"].get("log_probabilities", False)
+        self.pickle_logs = train_config["reinforcement_learning"].get("pickle_logs", False)
+        self.topk = train_config["reinforcement_learning"].get("topk", 20)
 
         # files for logging and storing
         self.model_dir = train_config["model_dir"]
         assert os.path.exists(self.model_dir)
+
+        if self.log_probabilities:
+            self.entropy_logger = make_retro_logger("{}/entropy.log".format(self.model_dir), "entropy_logger")
+            self.probability_logger = make_retro_logger("{}/probability.log".format(self.model_dir), "probability_logger")
+
+        if self.pickle_logs: 
+            self.collected_gold_ranks = []
+            self.collected_top10_probabilities = []
+            self.collected_highest_probabilities = []
+            self.collected_gold_probabilities = []
 
         self.logging_freq = train_config.get("logging_freq", 100)
         self.valid_report_file = f"{self.model_dir}/validations.txt"
@@ -79,8 +105,6 @@ class TrainManager:
 
         # objective
         self.label_smoothing = train_config.get("label_smoothing", 0.0)
-        self.model.loss_function = XentLoss(pad_index=self.model.pad_index,
-                                            smoothing=self.label_smoothing)
         self.normalization = train_config.get("normalization", "batch")
         if self.normalization not in ["batch", "tokens", "none"]:
             raise ConfigurationError("Invalid normalization option."
@@ -184,7 +208,11 @@ class TrainManager:
         self.device = torch.device("cuda" if self.use_cuda else "cpu")
         if self.use_cuda:
             self.model.to(self.device)
-
+        if self.reinforcement_learning:  
+            self.model.loss_function = ReinforceLoss(baseline=self.baseline, use_cuda=self.use_cuda, reward=self.reward)
+        else: 
+            self.model.loss_function = XentLoss(pad_index=self.model.pad_index,
+                                 smoothing=self.label_smoothing)
         # fp16
         self.fp16 = train_config.get("fp16", False)
         if self.fp16:
@@ -352,11 +380,11 @@ class TrainManager:
         else:
             logger.info("Reset tracking of the best checkpoint.")
 
-        if not reset_iter_state:
-            assert 'train_iter_state' in model_checkpoint
-            self.train_iter_state = model_checkpoint["train_iter_state"]
-        else:
-            logger.info("Reset train data iterator.")
+        # if not reset_iter_state:
+        #     assert 'train_iter_state' in model_checkpoint
+        #     self.train_iter_state = model_checkpoint["train_iter_state"]
+        # else:
+        #     logger.info("Reset train data iterator.")
 
         # move parameters to cuda
         if self.use_cuda:
@@ -536,7 +564,21 @@ class TrainManager:
         self.model.train()
 
         # get loss
-        batch_loss, _, _, _ = self.model(return_type="loss", **vars(batch))
+        if self.reinforcement_learning: 
+            batch_loss, distribution, _, _ = self.model(
+            return_type=self.method,
+            src=batch.src, trg=batch.trg,
+            trg_input=batch.trg_input, src_mask=batch.src_mask,
+            src_length=batch.src_length, trg_mask=batch.trg_mask,
+            max_output_length=self.max_output_length,
+            temperature = self.temperature, 
+            samples=self.samples, alpha = self.alpha,
+            add_gold=self.add_gold,
+            topk=self.topk,
+            log_probabilities=self.log_probabilities, 
+            pickle_logs=self.pickle_logs)
+        else:
+            batch_loss, distribution, _, _ = self.model(return_type="loss", **vars(batch))
 
         # sum multi-gpu losses
         if self.n_gpu > 1:
@@ -578,11 +620,12 @@ class TrainManager:
 
         valid_score, valid_loss, valid_ppl, valid_sources, \
         valid_sources_raw, valid_references, valid_hypotheses, \
-        valid_hypotheses_raw, valid_attention_scores = \
+        valid_hypotheses_raw, valid_attention_scores, valid_logs = \
             validate_on_data(
                 batch_size=self.eval_batch_size,
                 batch_class=self.batch_class,
                 data=valid_data,
+                config=self.config,
                 eval_metric=self.eval_metric,
                 level=self.level, model=self.model,
                 use_cuda=self.use_cuda,
@@ -661,6 +704,9 @@ class TrainManager:
                                           f"att.{self.stats.steps}",
                                   tb_writer=self.tb_writer,
                                   steps=self.stats.steps)
+        
+        if self.reinforcement_learning and self.log_probabilities:
+            self._log_reinforcement_learning(valid_logs, epoch_no, valid_hypotheses)
 
         return valid_duration
 
@@ -730,13 +776,52 @@ class TrainManager:
             if sources_raw is not None:
                 logger.debug("\tRaw source:     %s", sources_raw[p])
             if references_raw is not None:
-                logger.debug("\tRaw reference:  %s", references_raw[p])
+                logger.debug(f"\tRaw reference:  {references_raw[p]}".encode('utf-8'))
             if hypotheses_raw is not None:
-                logger.debug("\tRaw hypothesis: %s", hypotheses_raw[p])
+                logger.debug(f"\tRaw hypothesis: {hypotheses_raw[p]}".encode('utf-8'))
 
             logger.info("\tSource:     %s", sources[p])
-            logger.info("\tReference:  %s", references[p])
-            logger.info("\tHypothesis: %s", hypotheses[p])
+            logger.info(f"\tReference: {references[p]}".encode('utf-8'))
+            logger.info(f"\tHypothesis: {hypotheses[p]}".encode('utf-8'))
+
+    def _log_reinforcement_learning(self, valid_logs, epoch_no, valid_hypotheses):
+        entropy, gold_strings, predicted_strings, highest_words, total_probability, \
+                highest_word, highest_prob, gold_probabilities, gold_token_ranks, rewards, old_bleus = valid_logs
+        
+        self.probability_logger.info(
+                "Epoch %3d Step: %8d \n",
+                epoch_no + 1, self.stats.steps)
+        self.entropy_logger.info(
+                "Epoch %3d Step: %8d \n"
+                "Entropy: %12.8f",  
+                epoch_no + 1, self.stats.steps, entropy)
+        
+        total_probability = [torch.stack(el) for el in total_probability if el != []]
+        highest_prob = [torch.stack(el) for el in highest_prob if el != []]
+        gold_probabilities = [torch.stack(el) for el in gold_probabilities if el != []]
+        average_total_prob = torch.mean(torch.stack([torch.mean(el) for el in total_probability]))
+        average_highest_prob = torch.mean(torch.stack([torch.mean(el) for el in highest_prob]))
+        average_gold_prob = torch.mean(torch.stack([torch.mean(el) for el in gold_probabilities]))
+        
+        self.probability_logger.info(
+        "Average Top10 Probability: %2.4f \n"
+        "Average Highest Probability: %2.4f \n"
+        "Average Gold Probability: %2.4f \n", \
+                average_total_prob, average_highest_prob, average_gold_prob)
+        
+        if self.pickle_logs:
+            self.collected_top10_probabilities.append(total_probability)
+            self.collected_highest_probabilities.append(highest_prob)
+            self.collected_gold_probabilities.append(gold_probabilities)
+            self.collected_gold_ranks.append(gold_token_ranks)
+            with open(self.model_dir+"/top10.pickle", "wb") as f:
+                pickle.dump(self.collected_top10_probabilities, f)
+            with open(self.model_dir+"/highest_prob.pickle", "wb") as f:
+                pickle.dump(self.collected_highest_probabilities, f)
+            with open(self.model_dir+"/gold_token.pickle", "wb") as f:
+                pickle.dump(self.collected_gold_probabilities, f)
+            with open(self.model_dir+"/gold_ranks.pickle", "wb") as f:
+                pickle.dump(self.collected_gold_ranks, f)
 
     def _store_outputs(self, hypotheses: List[str]) -> None:
         """
@@ -815,6 +900,8 @@ def train(cfg_file: str, skip_test: bool = False) -> None:
     # load the data
     train_data, dev_data, test_data, src_vocab, trg_vocab = load_data(
         data_cfg=cfg["data"])
+
+    rl_method = cfg["training"]["reinforcement_learning"].get("method", False)
 
     # build an encoder-decoder model
     model = build_model(cfg["model"], src_vocab=src_vocab, trg_vocab=trg_vocab)

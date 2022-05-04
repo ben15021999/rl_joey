@@ -1,0 +1,98 @@
+name: "pg-cross-domain"
+
+data:
+  src: "en"
+  trg: "vi"
+  train: "test/data/iwslt_envi/train"
+  dev: "test/data/iwslt_envi/valid"
+  test: "test/data/iwslt_envi/test"
+  level: "word"
+  lowercase: True
+  max_sent_length: 110
+  src_vocab: "test/data/iwslt_envi/vocab.en"
+  trg_vocab: "test/data/iwslt_envi/vocab.vi"
+
+testing:
+  beam_size: 5
+  alpha: 1.0
+
+training:
+  load_model: "pretrained/best.ckpt"
+  reset_best_ckpt: True            # if True, reset the tracking of the best checkpoint and scores. Use for domain adaptation or fine-tuning with new metrics or dev data.
+  reset_scheduler: True            # if True, overwrite scheduler in loaded checkpoint with parameters specified in this config. Use for domain adaptation or fine-tuning.
+  reset_optimizer: True
+  random_seed: 42
+  optimizer: "adam"
+  normalization: "tokens"
+  adam_betas: [0.9, 0.999]
+  scheduling: "plateau"
+  patience: 5
+  decrease_factor: 0.7
+  loss: "crossentropy"
+  learning_rate: 0.0003
+  learning_rate_min: 0.00000001
+  learning_rate_factor: 1     # factor for Noam scheduler (default: 1)
+  learning_rate_warmup: 4000  # warmup steps for Noam scheduler
+  weight_decay: 0.0
+  label_smoothing: 0.1
+  batch_size: 128
+  batch_type: "token"
+  early_stopping_metric: "eval_metric"
+  epochs: 10
+  validation_freq: 500
+  logging_freq: 500
+  track_peakiness_freq: 500
+  eval_metric: "bleu"
+  model_dir: "models/transformer_iwslt15_envi_rl"
+  overwrite: True
+  shuffle: True
+  use_cuda: True
+  max_output_length: 60
+  print_valid_sents: [0, 1, 2, 3, 4]
+  keep_best_ckpts: 2
+
+  reinforcement_learning:
+    use_reinforcement_learning: True
+    method: "reinforce"
+    log_probabilities: True
+    topk: 100
+    pickle_logs: True
+    hyperparameters:
+      temperature: 1
+      alpha: 1
+      reward: "bleu"
+      samples: 5
+      baseline: "average_reward_baseline"
+
+model:
+    initializer: "xavier"
+    embed_initializer: "xavier"
+    embed_init_gain: 1.0
+    init_gain: 1.0
+    bias_initializer: "zeros"
+    tied_embeddings: False
+    tied_softmax: True
+    encoder:
+        type: "transformer"
+        num_layers: 6
+        num_heads: 4
+        embeddings:
+            embedding_dim: 256
+            scale: True
+            dropout: 0.
+        # typically ff_size = 4 x hidden_size
+        hidden_size: 256
+        ff_size: 1024
+        dropout: 0.3
+    decoder:
+        type: "transformer"
+        num_layers: 6
+        num_heads: 4
+        embeddings:
+            embedding_dim: 256
+            scale: True
+            dropout: 0.
+        # typically ff_size = 4 x hidden_size
+        hidden_size: 256
+        ff_size: 1024
+        dropout: 0.3
