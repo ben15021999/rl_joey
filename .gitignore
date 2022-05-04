@@ -5,3 +5,4 @@ dist/*
 docs/build/*
 *__pycache__*
 models
+pretrained
